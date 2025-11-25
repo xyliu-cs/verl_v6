@@ -20,7 +20,12 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopBase,
+    AgentLoopOutput,
+    MultiTrajectoryAgentLoopOutput,
+    register,
+)
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.interactions.base import BaseInteraction
 from verl.interactions.utils.interaction_registry import initialize_interactions_from_config
@@ -305,11 +310,46 @@ class ToolAgentLoop(AgentLoopBase):
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
 
-        # Finalize output
+        # Finalize output - handle multiple trajectories for StateLM
+        trajectories = []
+        
+        # First, add all snapshot trajectories (for StateLM deleteContext)
+        if self.statelm_enabled and agent_data.trajectory_snapshots:
+            for idx, snapshot in enumerate(agent_data.trajectory_snapshots):
+                # Extract data from snapshot
+                snapshot_prompt_ids = snapshot["prompt_ids"]
+                snapshot_response_mask = snapshot["response_mask"]
+                snapshot_response_logprobs = snapshot.get("response_logprobs", None)
+                
+                # Compute response_ids and prompt_ids from snapshot
+                snapshot_response_ids = snapshot_prompt_ids[-len(snapshot_response_mask):]
+                snapshot_prompt_only_ids = snapshot_prompt_ids[:len(snapshot_prompt_ids) - len(snapshot_response_mask)]
+                
+                # Create output for this snapshot trajectory
+                snapshot_output = AgentLoopOutput(
+                    prompt_ids=snapshot_prompt_only_ids,
+                    response_ids=snapshot_response_ids[: self.response_length],
+                    response_mask=snapshot_response_mask[: self.response_length],
+                    multi_modal_data={"image": agent_data.image_data} if agent_data.image_data is not None else {},
+                    response_logprobs=snapshot_response_logprobs[: self.response_length]
+                    if snapshot_response_logprobs
+                    else None,
+                    num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,  # Approximate
+                    metrics=agent_data.metrics,
+                    extra_fields={
+                        "turn_scores": agent_data.turn_scores[:idx+1] if agent_data.turn_scores else [],
+                        "tool_rewards": agent_data.tool_rewards[:idx+1] if agent_data.tool_rewards else [],
+                        "is_snapshot": True,
+                        "snapshot_index": idx,
+                    },
+                )
+                trajectories.append(snapshot_output)
+        
+        # Add the final trajectory
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
         prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
         multi_modal_data = {"image": agent_data.image_data} if agent_data.image_data is not None else {}
-        output = AgentLoopOutput(
+        final_output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
             response_mask=agent_data.response_mask[: self.response_length],
@@ -319,10 +359,19 @@ class ToolAgentLoop(AgentLoopBase):
             else None,
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
-            extra_fields={},
+            extra_fields={
+                "turn_scores": agent_data.turn_scores,
+                "tool_rewards": agent_data.tool_rewards,
+                "is_snapshot": False,
+            },
         )
-        output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
-        return output
+        trajectories.append(final_output)
+        
+        # Return MultiTrajectoryAgentLoopOutput if we have snapshots, otherwise single output
+        if self.statelm_enabled and len(trajectories) > 1:
+            return MultiTrajectoryAgentLoopOutput(trajectories=trajectories)
+        else:
+            return final_output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
