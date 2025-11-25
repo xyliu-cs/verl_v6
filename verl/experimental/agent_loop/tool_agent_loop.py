@@ -53,6 +53,7 @@ class AgentData:
         tools_kwargs: dict[str, Any],
         interaction: Optional[BaseInteraction] = None,
         interaction_kwargs: Optional[dict[str, Any]] = None,
+        document_content: Optional[str] = None,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -61,6 +62,7 @@ class AgentData:
         self.tools_kwargs = tools_kwargs
         self.interaction = interaction
         self.interaction_kwargs = interaction_kwargs or {}
+        self.document_content = document_content
 
         # State variables
         self.prompt_ids: list[int] = []
@@ -78,7 +80,7 @@ class AgentData:
         # ===========================
         # StateLM Customizations
         # ===========================
-        self.document_content: Optional[str] = None  # Full document text
+        # document_content is already set above from parameter
         
         # NEW: Editable state tracking
         self.full_history: list[dict] = copy.deepcopy(self.messages)
@@ -88,6 +90,12 @@ class AgentData:
         # NEW: View snapshots for causal log-prob
         self.emission_views: list[list[int]] = []  # prompt_ids when each assistant turn started
         self.assistant_turn_boundaries: list[tuple[int, int]] = []  # (start_idx, end_idx) in response_ids
+        
+        # Track snapshots for deleteContext operations
+        self.trajectory_snapshots: list[dict[str, Any]] = []  # Store trajectory state before each delete
+        
+        # Track whether we had a deleteContext operation
+        self.had_delete_operation: bool = False
 
         self.notes: dict[str, dict] = {}
 
@@ -230,6 +238,10 @@ class ToolAgentLoop(AgentLoopBase):
         cls.statelm_enabled = config.actor_rollout_ref.rollout.multi_turn.get("statelm_enabled", False)
         if cls.statelm_enabled:
             print("StateLM features enabled in ToolAgentLoop.")
+        
+        # Max model context length for protection
+        cls.max_model_length = config.actor_rollout_ref.rollout.get("max_model_length", 8192)
+        cls.context_length_penalty = config.actor_rollout_ref.rollout.multi_turn.get("context_length_penalty", -1.0)
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -346,6 +358,19 @@ class ToolAgentLoop(AgentLoopBase):
             # Need to update response_id as well
             if self.statelm_enabled:
                 agent_data.response_ids = agent_data.prompt_ids[len(self.system_prompt) :]
+        
+        # Context length protection: check if trajectory exceeds max model length
+        if self.statelm_enabled and len(agent_data.prompt_ids) + self.response_length > self.max_model_length:
+            logger.warning(
+                f"Trajectory length {len(agent_data.prompt_ids)} + response_length {self.response_length} "
+                f"exceeds max_model_length {self.max_model_length}. Early stopping with penalty."
+            )
+            # Set negative reward for exceeding context length
+            agent_data.metrics["context_length_exceeded"] = True
+            agent_data.metrics["early_stop_penalty"] = self.context_length_penalty
+            agent_data.turn_scores.append(self.context_length_penalty)
+            return AgentState.TERMINATED
+        
         return AgentState.GENERATING
 
     async def _handle_generating_state(
@@ -353,6 +378,15 @@ class ToolAgentLoop(AgentLoopBase):
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
+
+        # Track emission view before generation (for StateLM)
+        if self.statelm_enabled:
+            # Save the prompt_ids snapshot before this assistant turn
+            emission_view = copy.deepcopy(agent_data.prompt_ids)
+            agent_data.emission_views.append(emission_view)
+            
+            # Track the start position in response_mask for this assistant turn
+            turn_start_idx = len(agent_data.response_mask)
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output = await self.server_manager.generate(
@@ -368,6 +402,11 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [1] * len(agent_data.response_ids)
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
+        
+        # Track assistant turn boundaries (for StateLM)
+        if self.statelm_enabled:
+            turn_end_idx = len(agent_data.response_mask)
+            agent_data.assistant_turn_boundaries.append((turn_start_idx, turn_end_idx))
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
@@ -393,7 +432,7 @@ class ToolAgentLoop(AgentLoopBase):
             tool_calls_copy = copy.deepcopy(agent_data.tool_calls)
             agent_data.full_history.append({
                 "role": "assistant",
-                "content":  text_response,
+                "content": [{"text": text_response}],  # Content should be a list with text block
                 "tool_calls": [tc.model_dump() for tc in tool_calls_copy],
                 "msg_id": agent_data.msg_id_counter,
             })
@@ -414,15 +453,17 @@ class ToolAgentLoop(AgentLoopBase):
 
         tasks = []
         for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
-            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs))
+            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
 
         with simple_timer("tool_calls", agent_data.metrics):
             responses = await asyncio.gather(*tasks)
 
         # Process tool responses and update multi_modal_data
-        # Removed: agent_data.new_images_this_turn = []
         finish_tool_call = False
-        for tool_response, tool_reward, _ , tool_name in responses:
+        editor_tool_call = False
+        delete_msg_ids = []  # Collect message IDs to delete
+        
+        for tool_response, tool_reward, tool_result_dict , tool_name in responses:
             # Create message from tool response
             if tool_response.image or tool_response.video:
                 # Multi-modal content with structured format
@@ -444,19 +485,27 @@ class ToolAgentLoop(AgentLoopBase):
                 # Text-only content
                 message = {"role": "tool", "content": tool_response.text or ""}
 
+            # Handle special tool types
             if tool_name == 'finish':
                 finish_tool_call = True
             elif tool_name == 'deleteContext':
                 editor_tool_call = True
+                agent_data.had_delete_operation = True
+                # Extract message IDs to delete from tool result
+                if tool_result_dict and "deleted_msg_ids" in tool_result_dict:
+                    delete_msg_ids.extend(tool_result_dict["deleted_msg_ids"])
 
             add_messages.append(message)
             agent_data.messages.extend(add_messages)
+            
+            # Add tool result to full_history
+            invoking_assistant_id = agent_data.msg_id_counter - 1  # The last message should be assistant
             agent_data.full_history.append({
                 "role": "tool",
                 "content": message["content"],
                 "tool_name": tool_name,
                 "msg_id": agent_data.msg_id_counter,
-                "msg_id(invoking_assistant)": agent_data.msg_id_counter+1
+                "msg_id(invoking_assistant)": invoking_assistant_id
             })
             agent_data.msg_id_counter += 1
 
@@ -490,6 +539,39 @@ class ToolAgentLoop(AgentLoopBase):
 
             if tool_reward is not None:
                 agent_data.tool_rewards.append(tool_reward)
+
+        # Handle deleteContext operation: snapshot, mask, and delete
+        if self.statelm_enabled and editor_tool_call:
+            # Step 1: Create snapshot of current trajectory state
+            snapshot = {
+                "prompt_ids": copy.deepcopy(agent_data.prompt_ids),
+                "response_ids": copy.deepcopy(agent_data.response_ids),
+                "response_mask": copy.deepcopy(agent_data.response_mask),
+                "response_logprobs": copy.deepcopy(agent_data.response_logprobs) if agent_data.response_logprobs else None,
+                "full_history": copy.deepcopy(agent_data.full_history),
+                "deleted_msg_ids": copy.deepcopy(agent_data.deleted_msg_ids),
+                "emission_views": copy.deepcopy(agent_data.emission_views),
+                "assistant_turn_boundaries": copy.deepcopy(agent_data.assistant_turn_boundaries),
+            }
+            agent_data.trajectory_snapshots.append(snapshot)
+            
+            # Step 2: Mask ALL previous messages (set all previous response_mask to 0)
+            # Keep only the current tool result visible for learning
+            if len(agent_data.response_mask) > 0:
+                # Mask everything before the tool response we just added
+                current_length = len(agent_data.response_mask)
+                # We need to find where the tool response starts
+                # The tool response was added after processing, so we mask everything before it
+                for i in range(current_length):
+                    agent_data.response_mask[i] = 0
+                # Note: The tool response tokens will be added below with mask 0 anyway
+            
+            # Step 3: Mark messages as deleted
+            for msg_id in delete_msg_ids:
+                agent_data.deleted_msg_ids.add(msg_id)
+            
+            logger.info(f"DeleteContext operation: masked {len(agent_data.response_mask)} previous tokens, "
+                       f"deleted message IDs: {delete_msg_ids}")
 
         # Update prompt with tool responses
         if self.processor is not None:
@@ -583,14 +665,34 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.GENERATING
 
     async def _call_tool(
-        self, tool_call: FunctionCall, tools_kwargs: dict[str, Any]
-    ) -> tuple[ToolResponse, float, dict]:
+        self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData
+    ) -> tuple[ToolResponse, float, dict, str]:
         """Call tool and return tool response."""
         tool, instance_id = None, None
+        tool_name = ""
         try:
             # TODO: append malformed tool_call to the prompt: invalid function name or arguments
             tool_name = tool_call.name
             tool_args = json.loads(tool_call.arguments)
+            
+            # Handle deleteContext tool specially
+            if tool_name == "deleteContext" and self.statelm_enabled:
+                # Extract message IDs to delete from arguments
+                msg_ids_to_delete = tool_args.get("message_ids", [])
+                if not isinstance(msg_ids_to_delete, list):
+                    msg_ids_to_delete = [msg_ids_to_delete]
+                
+                # Return success response with deleted message IDs
+                return (
+                    ToolResponse(
+                        text=f"Successfully deleted {len(msg_ids_to_delete)} message(s) from context.",
+                    ),
+                    0.0,  # No immediate reward
+                    {"deleted_msg_ids": msg_ids_to_delete},
+                    tool_name,
+                )
+            
+            # Handle regular tools
             tool = self.tools[tool_name]
             kwargs = tools_kwargs.get(tool_name, {})
             instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
@@ -603,6 +705,7 @@ class ToolAgentLoop(AgentLoopBase):
                 ),
                 0.0,
                 {},
+                tool_name,
             )
         finally:
             if tool and instance_id:
@@ -628,7 +731,7 @@ class ToolAgentLoop(AgentLoopBase):
                 if attr_value is not None:
                     tool_response_kwargs[attr_name] = attr_value
 
-        return ToolResponse(**tool_response_kwargs), tool_reward, res, tool_name
+        return ToolResponse(**tool_response_kwargs), tool_reward, res if res else {}, tool_name
 
     @classmethod
     def _initialize_interactions(cls, interaction_config_file):
