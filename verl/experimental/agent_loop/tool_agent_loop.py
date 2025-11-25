@@ -75,6 +75,122 @@ class AgentData:
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
 
+        # ===========================
+        # StateLM Customizations
+        # ===========================
+        self.document_content: Optional[str] = None  # Full document text
+        
+        # NEW: Editable state tracking
+        self.full_history: list[dict] = copy.deepcopy(self.messages)
+        self.deleted_msg_ids: set[int] = set()  # Track deleted message IDs
+        self.msg_id_counter: int = 0  # Assign unique IDs to each message
+        
+        # NEW: View snapshots for causal log-prob
+        self.emission_views: list[list[int]] = []  # prompt_ids when each assistant turn started
+        self.assistant_turn_boundaries: list[tuple[int, int]] = []  # (start_idx, end_idx) in response_ids
+
+        self.notes: dict[str, dict] = {}
+
+    def _render_message_view(self) -> list[dict[str, Any]]:
+        """
+        Build a rendered view of the message history by taking into account editions invoked by StateLM.
+        """
+        stub_message = "Content has been deleted to save space."
+        rendered_message_view: list[dict[str, Any]] = []
+
+        if self.notes:
+            notes_summary = (
+                f"\n\n<external_memory>\n## Available Notes\n"
+                f"{"\n".join([f"- **{key}**: {data['summary']}" for key, data in self.notes.items()])}\n</external_memory>"
+            )
+        else:
+            notes_summary = (
+                f"\n\n<external_memory>\n## Available Notes\n"
+                "No notes recorded.\n</external_memory>"
+            )
+
+        for idx, msg in enumerate(self.full_history):
+            role = msg.get("role")
+
+            if role == "user":
+                text = msg["content"] + (notes_summary if idx == 0 else "")
+                rendered_message_view.append({"role": "user", "content": text})
+
+            elif role == "assistant":
+                msg_id = msg["msg_id"]
+                tool_calls = msg.get("tool_calls", [])
+
+                if msg_id in self.deleted_msg_ids:
+                    tool_calls = msg.get("tool_calls") or []
+                    if tool_calls:
+                        stub_tool_calls = []
+                        for tc in tool_calls:
+                            fn = tc.get("function") or {}
+                            name = fn.get("name") or ""
+
+                            stub_tool_calls.append({
+                                "id": tc.get("id"),
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    # arguments MUST be a JSON string
+                                    "arguments": json.dumps(
+                                        {"message": stub_message},
+                                    ),
+                                },
+                            })
+                        rendered_message_view.append({
+                            "role": "assistant",
+                            "content": stub_message,
+                            "tool_calls": stub_tool_calls,
+                        })
+                    else:
+                        rendered_message_view.append({
+                            "role": "assistant",
+                            "content": stub_message,
+                        })
+                # Undeleted messages
+                else:
+                    assistant_content = msg["content"]
+                    assert len(assistant_content) == 1, "Expected single content block in assistant message."
+                    raw_text = assistant_content[0]["text"]
+                    cleaned_text = raw_text.strip()
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": (cleaned_text if cleaned_text else ""),
+                    }
+                    # If this assistant turn contained tool calls, forward them verbatim
+                    if tool_calls:
+                        assistant_msg["tool_calls"] = msg["tool_calls"]
+                    rendered_message_view.append(assistant_msg)
+
+            elif role == "tool":
+                msg_id = msg["msg_id"]
+                msg_id_ia = msg["msg_id(invoking_assistant)"]
+                tool_result_content_cp = copy.deepcopy(msg["content"])
+                tool_result_content_cp["msg_id"] = msg_id
+                tool_result_content_cp["msg_id(invoking_assistant)"] = msg_id_ia
+                if msg_id in self.deleted_msg_ids:
+                    tool_name = msg.get("tool_name", "unknown")
+                    tool_result_content_cp = {
+                        "msg_id": msg_id,
+                        "msg_id(invoking_assistant)": msg_id_ia,
+                        "status": "success",
+                        "message": stub_message,
+                        "original_tool": tool_name
+                    }
+                    # if tool_name == "nextChunk":
+                    #     tool_result_content_cp["reading_progress"] = msg["content"]["reading_progress"]
+                
+                rendered_message_view.append(
+                    {
+                        "role": "tool",
+                        "content": json.dumps(tool_result_content_cp, ensure_ascii=False),
+                    }
+                )
+        return rendered_message_view
+
+
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
@@ -110,11 +226,18 @@ class ToolAgentLoop(AgentLoopBase):
         cls.interaction_config_file = config.actor_rollout_ref.rollout.multi_turn.interaction_config_path
         if cls.interaction_config_file:
             cls.interaction_map: dict[str, BaseInteraction] = cls._initialize_interactions(cls.interaction_config_file)
+        
+        cls.statelm_enabled = config.actor_rollout_ref.rollout.multi_turn.get("statelm_enabled", False)
+        if cls.statelm_enabled:
+            print("StateLM features enabled in ToolAgentLoop.")
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
         image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
+        # NEW: Extract document content from kwargs (not in messages)
+        document_content = kwargs.get("document_content", "")
+        
         metrics = {}
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})
@@ -138,12 +261,22 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data = AgentData(
             messages=messages,
             image_data=image_data,
+            document_content=document_content,  # NEW
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
         )
+
+        # NEW: Initialize full_history with the first user message
+        agent_data.msg_id_counter = 0
+        agent_data.full_history.append({
+            "role": "user",
+            "content": messages[0]["content"],  # Just the question
+            "msg_id": agent_data.msg_id_counter
+        })
+        agent_data.msg_id_counter += 1
 
         # State machine loop
         state = AgentState.PENDING
@@ -181,11 +314,16 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
+        if self.statelm_enabled:
+            messages = agent_data._render_message_view()
+        else:
+            messages = agent_data.messages
+
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
-                    agent_data.messages,
+                    messages,
                     tools=self.tool_schemas,
                     add_generation_prompt=True,
                     tokenize=False,
@@ -198,13 +336,16 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.prompt_ids = await self.loop.run_in_executor(
                 None,
                 lambda: self.tokenizer.apply_chat_template(
-                    agent_data.messages,
+                    messages,
                     tools=self.tool_schemas,
                     add_generation_prompt=True,
                     tokenize=True,
                     **self.apply_chat_template_kwargs,
                 ),
             )
+            # Need to update response_id as well
+            if self.statelm_enabled:
+                agent_data.response_ids = agent_data.prompt_ids[len(self.system_prompt) :]
         return AgentState.GENERATING
 
     async def _handle_generating_state(
@@ -237,7 +378,7 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
 
         # Extract tool calls
-        _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
+        text_response, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
 
         # Handle interaction if needed
         if self.interaction_config_file:
@@ -246,6 +387,17 @@ class ToolAgentLoop(AgentLoopBase):
             )
             add_messages.append({"role": "assistant", "content": assistant_message})
             agent_data.messages.extend(add_messages)
+
+        if self.statelm_enabled:
+            # Append assistant message to full_history
+            tool_calls_copy = copy.deepcopy(agent_data.tool_calls)
+            agent_data.full_history.append({
+                "role": "assistant",
+                "content":  text_response,
+                "tool_calls": [tc.model_dump() for tc in tool_calls_copy],
+                "msg_id": agent_data.msg_id_counter,
+            })
+            agent_data.msg_id_counter += 1
 
         # Determine next state
         if agent_data.tool_calls:
@@ -269,7 +421,8 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
-        for tool_response, tool_reward, _ in responses:
+        finish_tool_call = False
+        for tool_response, tool_reward, _ , tool_name in responses:
             # Create message from tool response
             if tool_response.image or tool_response.video:
                 # Multi-modal content with structured format
@@ -291,8 +444,21 @@ class ToolAgentLoop(AgentLoopBase):
                 # Text-only content
                 message = {"role": "tool", "content": tool_response.text or ""}
 
+            if tool_name == 'finish':
+                finish_tool_call = True
+            elif tool_name == 'deleteContext':
+                editor_tool_call = True
+
             add_messages.append(message)
             agent_data.messages.extend(add_messages)
+            agent_data.full_history.append({
+                "role": "tool",
+                "content": message["content"],
+                "tool_name": tool_name,
+                "msg_id": agent_data.msg_id_counter,
+                "msg_id(invoking_assistant)": agent_data.msg_id_counter+1
+            })
+            agent_data.msg_id_counter += 1
 
             # Handle image data
             if tool_response.image:
@@ -348,6 +514,15 @@ class ToolAgentLoop(AgentLoopBase):
         response_ids = response_ids[len(self.system_prompt) :]
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
             return AgentState.TERMINATED
+        
+        # For StateLM, we leave the state data handling to the PENDING state
+        if self.statelm_enabled:
+            if finish_tool_call or agent_data.assistant_turns >= self.max_assistant_turns:
+                return AgentState.TERMINATED
+            elif editor_tool_call: # For editing tool call, need to re-render the message view
+                return AgentState.PENDING
+
+        # For non-editing tool call, we can just append the tool response to prompt directly
         # Update prompt_ids and response_mask
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
@@ -453,7 +628,7 @@ class ToolAgentLoop(AgentLoopBase):
                 if attr_value is not None:
                     tool_response_kwargs[attr_name] = attr_value
 
-        return ToolResponse(**tool_response_kwargs), tool_reward, res
+        return ToolResponse(**tool_response_kwargs), tool_reward, res, tool_name
 
     @classmethod
     def _initialize_interactions(cls, interaction_config_file):

@@ -102,6 +102,7 @@ class RLHFDataset(Dataset):
         self.prompt_key = config.get("prompt_key", "prompt")
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
+        self.document_key = config.get("document_key", "document")  # NEW
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
@@ -227,6 +228,10 @@ class RLHFDataset(Dataset):
         """
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
+
+        # NEW: Extract document_content if present
+        document_content = row_dict.pop(self.document_key, "")  # Extract from parquet
+        
         model_inputs = {}
 
         if self.processor is not None:
@@ -370,6 +375,9 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+
+        # NEW: Add document_content back to row_dict
+        row_dict["document_content"] = document_content
         return row_dict
 
     def __getstate__(self):
