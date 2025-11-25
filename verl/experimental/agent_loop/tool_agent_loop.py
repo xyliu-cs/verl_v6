@@ -103,6 +103,9 @@ class AgentData:
         self.had_delete_operation: bool = False
 
         self.notes: dict[str, dict] = {}
+        
+        # StateLM State Manager for document operations
+        self.doc_state_manager = None
 
     def _render_message_view(self) -> list[dict[str, Any]]:
         """
@@ -294,6 +297,11 @@ class ToolAgentLoop(AgentLoopBase):
             "msg_id": agent_data.msg_id_counter
         })
         agent_data.msg_id_counter += 1
+        
+        # Initialize StateLM state manager if document_content is provided
+        if self.statelm_enabled and document_content:
+            from verl.tools.statelm_tools import DocStateManager
+            agent_data.doc_state_manager = DocStateManager(self.tokenizer, document_content)
 
         # State machine loop
         state = AgentState.PENDING
@@ -366,6 +374,13 @@ class ToolAgentLoop(AgentLoopBase):
             },
         )
         trajectories.append(final_output)
+        
+        # Cleanup state manager if needed
+        if self.statelm_enabled and agent_data.doc_state_manager:
+            try:
+                agent_data.doc_state_manager.clear_current_document()
+            except Exception as e:
+                logger.warning(f"Error clearing state manager: {e}")
         
         # Return MultiTrajectoryAgentLoopOutput if we have snapshots, otherwise single output
         if self.statelm_enabled and len(trajectories) > 1:
@@ -745,7 +760,25 @@ class ToolAgentLoop(AgentLoopBase):
             tool = self.tools[tool_name]
             kwargs = tools_kwargs.get(tool_name, {})
             instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
-            tool_execution_response, tool_reward, res = await tool.execute(instance_id, tool_args)
+            
+            # Prepare execution kwargs for StateLM tools
+            exec_kwargs = {}
+            if self.statelm_enabled:
+                statelm_tool_names = {
+                    'analyzeText', 'loadDocument', 'buildIndex', 'readChunk',
+                    'searchEngine', 'note', 'readNote', 'updateNote', 'mergeNotes',
+                    'checkBudget', 'getContextStats', 'finish'
+                }
+                if tool_name in statelm_tool_names:
+                    exec_kwargs['agent_data'] = agent_data
+                    exec_kwargs['state_manager'] = agent_data.doc_state_manager
+                    exec_kwargs['tokenizer'] = self.tokenizer
+                    exec_kwargs['tool_schemas'] = self.tool_schemas
+                    exec_kwargs['max_context_exp'] = getattr(self, 'max_model_length', 8192)
+                    exec_kwargs['max_output_tokens'] = self.response_length
+                    exec_kwargs['max_turns'] = self.max_assistant_turns
+            
+            tool_execution_response, tool_reward, res = await tool.execute(instance_id, tool_args, **exec_kwargs)
         except Exception as e:
             logger.warning(f"Error when executing tool: {e}")
             return (
